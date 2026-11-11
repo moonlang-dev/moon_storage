@@ -1,0 +1,642 @@
+// moon_storage.storage — a keyed filesystem over one or more rooted directories.
+//
+// A key is a relative path, and every operation resolves it inside a root and
+// refuses to leave: `..`, an absolute key, and a symlink pointing outward are
+// all containment failures rather than reads of somebody else's file. That
+// check is segment-aware, because a prefix test alone accepts `/videos-evil`
+// for a root of `/videos`.
+//
+// Multi-root because a library outgrows a disk: reads search every root in
+// order, writes go to the first. What the caller sees is one namespace.
+
+use std.fs
+use std.futures
+use std.os
+use std.path
+use std.strings
+
+/// Metadata for one stored key.
+pub struct StorageItem {
+    /// Root-relative POSIX key naming the file.
+    key: string,
+    /// Final path component of the key.
+    name: string,
+    /// File length in bytes.
+    size: long,
+    /// Last modification time in milliseconds since the Unix epoch.
+    modified_ms: long,
+    /// MIME type guessed from the extension.
+    content_type: string,
+}
+
+/// Total and available bytes for a storage filesystem.
+pub struct DiskSpace {
+    /// Capacity of the filesystem holding the root.
+    total_bytes: long,
+    /// Bytes still writable on it.
+    available_bytes: long,
+}
+
+/// Filesystem-backed adapter rooted at one directory.
+pub struct Adapter {
+    /// Absolute directory every key of this adapter resolves under.
+    base_path: string,
+}
+
+/// Ordered collection of storage roots with deterministic key placement.
+pub struct MultiAdapter {
+    /// The roots in priority order; the first one is where writes land.
+    adapters: [Adapter],
+}
+
+/// `path.resolve(value)`: absolute, lexically normalized.
+///
+/// - `value`: Path to resolve against the current directory.
+pub fn absolute(value: string) -> string {
+    let joined = if path.is_absolute(value) {
+        value
+    } else {
+        path.join2(os.getcwd(), value)
+    }
+    path.normalize(joined)
+}
+
+/// Creates the directory (recursively) and returns a rooted adapter.
+///
+/// - `base_path`: Directory to root the adapter at, created along with its
+///   parents.
+///
+/// ```moon
+/// use moon_storage.storage
+///
+/// fn main() {
+///   let files = storage.create(".moon/storage").unwrap()
+///   files.write("notes/moon.txt", "moon\n").unwrap()
+///   files.append("notes/moon.txt", "Tour\n").unwrap()
+///   println(files.exists("notes/moon.txt"))
+///   println(files.read("notes/moon.txt").unwrap())
+///   println(files.stat_item("notes/moon.txt").unwrap().size)
+///   println(files.list("notes").unwrap().len())
+///   files.rename("notes/moon.txt", "notes/tour.txt").unwrap()
+///   files.truncate("notes/tour.txt", 4).unwrap()
+///   files.delete("notes/tour.txt").unwrap()
+/// }
+/// ```
+pub fn create(base_path: string) -> Result<Adapter, Error> {
+    let root = absolute(base_path)
+    if fs.mkdir_all(root).is_err() {
+        return err.OPERATION_FAILED("cannot create storage directory: " + root)
+    }
+    ok(Adapter {
+        base_path: root,
+    })
+}
+
+/// Creates a multi-root adapter after validating the supplied directories.
+///
+/// - `directories`: Roots in priority order; the first is the write target.
+///
+/// ```moon
+/// use moon_storage.storage
+///
+/// async fn main() {
+///   let files = storage.create_multi(["/mnt/fast", "/mnt/archive"]).unwrap()
+///   println(files.base_path())
+///   println(files.base_paths())
+///   files.write("video/moon.mp4", "bytes").unwrap()
+///   println(files.adapter_for("video/moon.mp4").is_some())
+///   println((await files.list("video")).unwrap())
+///   let capacity = files.disk_space()
+///   println(capacity.total_bytes)
+///   println(capacity.available_bytes)
+/// }
+/// ```
+pub fn create_multi(directories: [string]) -> Result<MultiAdapter, Error> {
+    if directories.len() == 0 {
+        return err.VALIDATION_ERROR("at least one video directory is required")
+    }
+    let mut adapters: [Adapter] = []
+    for directory in directories {
+        adapters.push(create(directory)?)
+    }
+    ok(MultiAdapter {
+        adapters: adapters,
+    })
+}
+
+/// True when `candidate` is `root` itself or lies beneath it, comparing whole
+/// path segments rather than raw string prefixes.
+///
+/// - `root`: Directory that must contain the candidate.
+/// - `candidate`: Path to test, compared segment by segment.
+///
+/// ```moon
+/// let root = moon_storage.storage.absolute(".moon/storage")
+/// println(moon_storage.storage.contains_path(root, root + "/notes/moon.txt"))
+/// println(moon_storage.storage.contains_path(root, root + "-backup/file"))
+/// println(moon_storage.storage.disk_space_of(root).available_bytes)
+/// ```
+pub fn contains_path(root: string, candidate: string) -> bool {
+    if candidate == root {
+        return true
+    }
+    let separator = path.separator()
+    let prefix = if root.ends_with(separator) {
+        root
+    } else {
+        root + separator
+    }
+    candidate.starts_with(prefix)
+}
+
+// Whether every existing component of `full` below `root` that is a
+// symbolic link resolves inside `root`; a missing tail is fine, since it is
+// about to be created.
+fn links_stay_inside(root: string, full: string) -> bool {
+    let real_root = fs.realpath(root).unwrap_or("")
+    if real_root == "" {
+        return true
+    }
+    let mut current = full
+    while current != root && current.len() > root.len() {
+        if fs.lstat(current).map(|info| info.is_symlink) ?? false {
+            let target = fs.realpath(current).unwrap_or("")
+            return target == "" || contains_path(real_root, target)
+        }
+        current = path.dirname(current)
+    }
+    true
+}
+
+impl Adapter {
+    /// `resolvePath`: the absolute path for a key, or a validation error when the
+    /// key escapes the base directory.
+    ///
+    /// - `key`: Storage key, relative to the root and never escaping it.
+    fn resolve_path(self: Adapter, key: string) -> Result<string, Error> {
+        let full = path.normalize(path.join2(self.base_path, key))
+        if !contains_path(self.base_path, full) {
+            return err.VALIDATION_ERROR("invalid path: outside base directory")
+        }
+        if !links_stay_inside(self.base_path, full) {
+            return err.VALIDATION_ERROR("invalid path: a symbolic link leads outside the base directory")
+        }
+        ok(full)
+    }
+
+    /// Reports whether the key exists in the selected storage root.
+    ///
+    /// - `key`: Storage key, relative to the root and never escaping it.
+    fn exists(self: Adapter, key: string) -> bool {
+        match self.resolve_path(key) {
+            ok(full) => fs.exists(full),
+            err(_) => false,
+        }
+    }
+
+    /// `stat(key)`: the storage item, or `none` when the key does not exist.
+    ///
+    /// - `key`: Storage key, relative to the root and never escaping it.
+    fn stat_item(self: Adapter, key: string) -> Optional<StorageItem> {
+        let full = match self.resolve_path(key) {
+            ok(value) => value,
+            err(_) => {
+                return none
+            },
+        }
+        let info = match fs.stat(full) {
+            ok(found) => found,
+            err(_) => return none,
+        }
+        if info.is_dir {
+            return none
+        }
+        some(StorageItem {
+            key: key,
+            name: path.basename(key),
+            size: info.size,
+            modified_ms: info.mtime_ms,
+            content_type: "",
+        })
+    }
+
+    /// Every file under `prefix`, recursively, skipping dot-directories — the
+    /// same traversal `list()` performs.
+    ///
+    /// - `prefix`: Key prefix to walk under; empty lists the whole root.
+    fn list(self: Adapter, prefix: string) -> Result<[StorageItem], Error> {
+        let root = if prefix == "" {
+            self.base_path
+        } else {
+            self.resolve_path(prefix)?
+        }
+        if !fs.exists(root) {
+            return err.NOT_FOUND(errors_not_found_path(root))
+        }
+        let mut items: [StorageItem] = []
+        walk_into(self.base_path, root, &mut items)
+        ok(items)
+    }
+
+    /// Reads the key, returning none when it does not exist.
+    ///
+    /// - `key`: Storage key, relative to the root and never escaping it.
+    fn read(self: Adapter, key: string) -> Optional<string> {
+        let full = match self.resolve_path(key) {
+            ok(value) => value,
+            err(_) => {
+                return none
+            },
+        }
+        if !fs.exists(full) {
+            return none
+        }
+        fs.read_file(full).ok()
+    }
+
+    /// Replaces a key's contents and returns the bytes written.
+    ///
+    /// - `key`: Storage key, relative to the root and never escaping it.
+    /// - `data`: Bytes to write.
+    fn write(self: Adapter, key: string, data: string) -> Result<int, Error> {
+        let full = self.resolve_path(key)?
+        let parent = path.dirname(full)
+        if parent != "" && fs.mkdir_all(parent).is_err() {
+            return err.OPERATION_FAILED("cannot create directory: " + parent)
+        }
+        if fs.write_file(full, data).is_err() {
+            return err.OPERATION_FAILED("write failed: " + key)
+        }
+        ok(data.len())
+    }
+
+    /// Appends data to a key and returns the bytes written.
+    ///
+    /// - `key`: Storage key, relative to the root and never escaping it.
+    /// - `data`: Bytes to append.
+    fn append(self: Adapter, key: string, data: string) -> Result<int, Error> {
+        let full = self.resolve_path(key)?
+        let parent = path.dirname(full)
+        if parent != "" && fs.mkdir_all(parent).is_err() {
+            return err.OPERATION_FAILED("cannot create directory: " + parent)
+        }
+        if fs.append_file(full, data).is_err() {
+            return err.OPERATION_FAILED("append failed: " + key)
+        }
+        ok(data.len())
+    }
+
+    /// Truncates a key to the requested byte size.
+    ///
+    /// - `key`: Storage key, relative to the root and never escaping it.
+    /// - `size`: Byte length to cut the file to.
+    fn truncate(self: Adapter, key: string, size: long) -> Result<long, Error> {
+        if size < 0 {
+            return err.VALIDATION_ERROR("invalid truncate size: " + to_string(size))
+        }
+        let full = self.resolve_path(key)?
+        let handle = fs.open(full, "rw")?
+        let existing = fs.size(handle)?
+        if size >= existing {
+            fs.close(handle)
+            return ok(existing)
+        }
+        let head = fs.read_at(handle, 0, size as int)?
+        fs.close(handle)
+        if fs.write_file(full, head).is_err() {
+            return err.OPERATION_FAILED("truncate failed: " + key)
+        }
+        ok(size)
+    }
+
+    /// Deletes a key from storage.
+    ///
+    /// - `key`: Storage key, relative to the root and never escaping it.
+    fn delete(self: Adapter, key: string) -> Result<int, Error> {
+        let full = self.resolve_path(key)?
+        if !fs.exists(full) {
+            return ok(0)
+        }
+        if fs.remove_file(full).is_err() {
+            return err.OPERATION_FAILED("delete failed: " + key)
+        }
+        ok(1)
+    }
+
+    /// Renames a key within storage.
+    ///
+    /// - `old_key`: Existing key.
+    /// - `new_key`: Key to move it to, within the same root.
+    fn rename(self: Adapter, old_key: string, new_key: string) -> Result<int, Error> {
+        let source = self.resolve_path(old_key)?
+        let destination = self.resolve_path(new_key)?
+        let parent = path.dirname(destination)
+        if parent != "" && fs.mkdir_all(parent).is_err() {
+            return err.OPERATION_FAILED("cannot create directory: " + parent)
+        }
+        if fs.rename(source, destination).is_err() {
+            return err.OPERATION_FAILED("rename failed: " + old_key + " -> " + new_key)
+        }
+        ok(1)
+    }
+
+    /// Returns capacity and available bytes for the storage root.
+    fn disk_space(self: Adapter) -> DiskSpace {
+        disk_space_of(self.base_path)
+    }
+
+    /// The device id of the base path, so a multi-adapter counts one filesystem
+    /// once even when several video directories live on it.
+    fn device_id(self: Adapter) -> string {
+        device_of(self.base_path)
+    }
+}
+
+fn errors_not_found_path(root: string) -> string {
+    "storage path not found: " + root
+}
+
+/// Recursive directory walk collecting files as `base`-relative POSIX keys.
+///
+/// - `base`: Root the collected keys are made relative to.
+/// - `directory`: Directory being walked.
+/// - `items`: Accumulator the found files are appended to.
+fn walk_into(base: string, directory: string, items: &mut [StorageItem]) {
+    for entry in fs.list_dir(directory) {
+        let full = path.join2(directory, entry)
+        let info = match fs.stat(full) {
+            ok(found) => found,
+            err(_) => continue,
+        }
+        if info.is_dir {
+            if entry.starts_with(".") {
+                continue
+            }
+            walk_into(base, full, items)
+            continue
+        }
+        if !info.is_file {
+            continue
+        }
+        items.push(
+            StorageItem {
+                key: relative_key(base, full),
+                name: entry,
+                size: info.size,
+                modified_ms: info.mtime_ms,
+                content_type: "",
+            },
+        )
+    }
+}
+
+fn relative_key(base: string, full: string) -> string {
+    let separator = path.separator()
+    let prefix = if base.ends_with(separator) {
+        base
+    } else {
+        base + separator
+    }
+    let relative = if full.starts_with(prefix) {
+        full.slice(prefix.len(), full.len())
+    } else {
+        full
+    }
+    path.to_posix(relative)
+}
+
+/// The total and available bytes of the volume holding `directory`, from
+/// `fs.disk_usage`.
+///
+/// - `directory`: Path whose filesystem is measured.
+pub fn disk_space_of(directory: string) -> DiskSpace {
+    match fs.disk_usage(directory) {
+        ok(usage) => DiskSpace {
+            total_bytes: usage.total,
+            available_bytes: usage.available,
+        },
+        err(_) => DiskSpace { total_bytes: 0, available_bytes: 0 },
+    }
+}
+
+// The device holding `directory`, so roots on one volume count its space once.
+fn device_of(directory: string) -> string {
+    match fs.stat(directory) {
+        ok(info) => "${info.dev}",
+        err(_) => directory,
+    }
+}
+/// One root's walk, as a task of its own — the unit `MultiAdapter.list` fans
+/// out over. `Adapter.list` itself stays synchronous: nothing inside a single
+/// root overlaps with anything, and a package's simplest surface should not
+/// become a `Future` to serve one caller's concurrency.
+///
+/// - `adapter`: Root to walk.
+/// - `prefix`: Key prefix to walk under.
+async fn list_one(adapter: Adapter, prefix: string) -> Result<[StorageItem], Error> {
+    adapter.list(prefix)
+}
+
+impl MultiAdapter {
+    /// Returns the primary storage base path.
+    fn base_path(self: MultiAdapter) -> string {
+        self.adapters[0].base_path
+    }
+
+    /// Returns all configured storage base paths.
+    fn base_paths(self: MultiAdapter) -> [string] {
+        let mut paths: [string] = []
+        for adapter in self.adapters {
+            paths.push(adapter.base_path)
+        }
+        paths
+    }
+
+    /// Combined capacity, counting each filesystem once.
+    fn disk_space(self: MultiAdapter) -> DiskSpace {
+        let mut seen: {string: bool} = {:}
+        let mut total: long = 0
+        let mut available: long = 0
+        for adapter in self.adapters {
+            let device = adapter.device_id()
+            if seen.has(device) {
+                continue
+            }
+            seen[device] = true
+            let space = adapter.disk_space()
+            total = total + space.total_bytes
+            available = available + space.available_bytes
+        }
+        DiskSpace {
+            total_bytes: total,
+            available_bytes: available,
+        }
+    }
+
+    /// Union of every adapter's listing; the first adapter holding a key wins.
+    ///
+    /// One walk task per root, so a library spread across a fast disk and a
+    /// spun-down USB one waits ~max rather than ~sum. That works because every
+    /// `std.fs` builtin brackets its raw syscall region in
+    /// `Blocking.begin`/`end`: the baton goes back to the driver
+    /// for the whole `getdents64`/`statx`, and the sibling walks run on their
+    /// own OS threads meanwhile.
+    ///
+    /// First-adapter-wins is carried by the **merge** order, not the walk
+    /// order: `join_all` returns results in input order, so the dedup loop
+    /// below sees the adapters in exactly the sequence the old serial loop did.
+    /// The returned error is likewise the first in adapter order, matching the
+    /// `?` this replaced. What does change is failure *coverage*: a middle
+    /// adapter's error no longer stops the later roots from being read. They
+    /// run anyway and their results are dropped. Listing is read-only, so that
+    /// is wasted work on the error path and nothing more.
+    ///
+    /// It remains true that the fix that works best is upstream, in not calling
+    /// this: a caller that knows which keys changed patches those entries
+    /// (`stat_item`) instead of asking for the whole namespace again.
+    ///
+    /// - `prefix`: Key prefix to walk under in every root.
+    async fn list(self: MultiAdapter, prefix: string) -> Result<[StorageItem], Error> {
+        let walks: futures.Group<Result<[StorageItem], Error>> = futures.group()
+        for adapter in self.adapters {
+            walks.spawn(list_one(adapter, prefix))
+        }
+        let listings = await walks.await_all()
+        let mut seen: {string: bool} = {:}
+        let mut items: [StorageItem] = []
+        for listing in listings {
+            for item in listing? {
+                if seen.has(item.key) {
+                    continue
+                }
+                seen[item.key] = true
+                items.push(item)
+            }
+        }
+        ok(items)
+    }
+
+    /// Returns the storage adapter selected for a key.
+    ///
+    /// - `key`: Storage key to place; the first root holding it wins.
+    fn adapter_for(self: MultiAdapter, key: string) -> Optional<Adapter> {
+        for adapter in self.adapters {
+            if adapter.exists(key) {
+                return some(adapter)
+            }
+        }
+        none
+    }
+
+    /// Reports whether the key exists in the selected storage root.
+    ///
+    /// - `key`: Storage key, relative to the root and never escaping it.
+    fn exists(self: MultiAdapter, key: string) -> bool {
+        self.adapter_for(key).is_some()
+    }
+
+    /// Returns metadata for a stored key when present.
+    ///
+    /// - `key`: Storage key, relative to the root and never escaping it.
+    fn stat_item(self: MultiAdapter, key: string) -> Optional<StorageItem> {
+        for adapter in self.adapters {
+            match adapter.stat_item(key) {
+                some(item) => {
+                    return some(item)
+                },
+                none => {},
+            }
+        }
+        none
+    }
+
+    /// The absolute path of a key, wherever it lives.
+    ///
+    /// - `key`: Storage key, relative to the root and never escaping it.
+    fn path_of(self: MultiAdapter, key: string) -> Optional<string> {
+        for adapter in self.adapters {
+            if adapter.exists(key) {
+                match adapter.resolve_path(key) {
+                    ok(full) => {
+                        return some(full)
+                    },
+                    err(_) => {
+                        return none
+                    },
+                }
+            }
+        }
+        none
+    }
+
+    /// Reads the key, returning none when it does not exist.
+    ///
+    /// - `key`: Storage key, relative to the root and never escaping it.
+    fn read(self: MultiAdapter, key: string) -> Optional<string> {
+        for adapter in self.adapters {
+            match adapter.read(key) {
+                some(data) => {
+                    return some(data)
+                },
+                none => {},
+            }
+        }
+        none
+    }
+
+    /// Writes always land in the first directory.
+    ///
+    /// - `key`: Storage key, relative to the root and never escaping it.
+    /// - `data`: Bytes to write.
+    fn write(self: MultiAdapter, key: string, data: string) -> Result<int, Error> {
+        self.adapters[0].write(key, data)
+    }
+
+    /// Appends data to a key and returns the bytes written.
+    ///
+    /// - `key`: Storage key, relative to the root and never escaping it.
+    /// - `data`: Bytes to append.
+    fn append(self: MultiAdapter, key: string, data: string) -> Result<int, Error> {
+        match self.adapter_for(key) {
+            some(adapter) => adapter.append(key, data),
+            none => self.adapters[0].append(key, data),
+        }
+    }
+
+    /// Truncates a key to the requested byte size.
+    ///
+    /// - `key`: Storage key, relative to the root and never escaping it.
+    /// - `size`: Byte length to cut the file to.
+    fn truncate(self: MultiAdapter, key: string, size: long) -> Result<long, Error> {
+        match self.adapter_for(key) {
+            some(adapter) => adapter.truncate(key, size),
+            none => err.NOT_FOUND("truncate: " + key + " not found"),
+        }
+    }
+
+    /// Deletes a key from storage.
+    ///
+    /// - `key`: Storage key, relative to the root and never escaping it.
+    fn delete(self: MultiAdapter, key: string) -> Result<int, Error> {
+        match self.adapter_for(key) {
+            some(adapter) => adapter.delete(key),
+            none => ok(0),
+        }
+    }
+
+    /// Renames a key within storage.
+    ///
+    /// - `old_key`: Existing key.
+    /// - `new_key`: Key to move it to.
+    fn rename(self: MultiAdapter, old_key: string, new_key: string) -> Result<int, Error> {
+        match self.adapter_for(old_key) {
+            some(adapter) => adapter.rename(old_key, new_key),
+            none => err.NOT_FOUND("rename: " + old_key + " not found"),
+        }
+    }
+
+    /// The write target for a new key: the first directory.
+    fn write_adapter(self: MultiAdapter) -> Adapter {
+        self.adapters[0]
+    }
+}
